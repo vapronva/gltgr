@@ -542,7 +542,7 @@ func (s *Server) gitlabGetJSON(
 	if err != nil {
 		return fmt.Errorf("%s request: %w", what, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(
 			io.LimitReader(resp.Body, errBodyPreviewBytes),
@@ -687,7 +687,7 @@ func (s *Server) summarise(
 	if err != nil {
 		return "", fmt.Errorf("openrouter request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, aiResponseMaxBytes))
 	var cr chatResp
 	if err = json.Unmarshal(rb, &cr); err != nil {
@@ -747,7 +747,7 @@ func (s *Server) sendTelegram(ctx context.Context, text string) error {
 	if err != nil {
 		return s.scrubTG(fmt.Errorf("telegram request: %w", err))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, tgResponseMaxBytes))
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("telegram %d: %s", resp.StatusCode, bytes.TrimSpace(rb))
