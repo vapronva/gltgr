@@ -336,20 +336,22 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	event := r.Header.Get("X-Gitlab-Event")
-	switch event {
-	case "Push Hook", "Tag Push Hook":
-	case "":
+	if event == "" {
 		http.Error(w, "missing X-Gitlab-Event", http.StatusBadRequest)
-		return
-	default:
-		s.log.Debug().Str("event", event).Msg("ignored event type")
-		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	var ev PushEvent
 	if err = json.Unmarshal(body, &ev); err != nil {
 		s.log.Error().Err(err).Msg("unmarshal push event")
 		http.Error(w, "bad payload", http.StatusBadRequest)
+		return
+	}
+	if !isPushEvent(event, &ev) {
+		s.log.Debug().
+			Str("event", event).
+			Str("event_name", ev.EventName).
+			Msg("ignored event type")
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	select {
@@ -370,6 +372,17 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 				Msg("process push failed")
 		}
 	})
+}
+
+func isPushEvent(header string, ev *PushEvent) bool {
+	switch header {
+	case "Push Hook", "Tag Push Hook":
+		return true
+	case "System Hook":
+		return ev.EventName == "push" || ev.EventName == "tag_push"
+	default:
+		return false
+	}
 }
 
 func (s *Server) verifyAuth(h http.Header, body []byte) bool {
