@@ -862,17 +862,14 @@ func shortSHA(id string) string {
 func splitCommitMessage(message, title string) (string, string) {
 	message = strings.TrimSpace(message)
 	before, after, ok := strings.Cut(message, "\n")
-	if title == "" {
-		if ok {
-			title = strings.TrimSpace(before)
-		} else {
-			title = message
-		}
+	full := strings.TrimSpace(before)
+	if full == "" {
+		full = strings.TrimSpace(title)
 	}
 	if ok {
-		return title, strings.TrimSpace(after)
+		return full, strings.TrimSpace(after)
 	}
-	return title, ""
+	return full, ""
 }
 
 func collapseBody(s string) string {
