@@ -36,7 +36,6 @@ const (
 	shutdownTimeout        = 15 * time.Second
 	summaryMaxTokens       = 200
 	shortSHALen            = 8
-	commitBodyMaxLen       = 240
 	tgTruncateMarker       = "\n…<i>(truncated)</i>"
 	tgTruncateSuffixBudget = 32
 	errBodyPreviewBytes    = 512
@@ -825,14 +824,9 @@ func formatMessage(
 		fmt.Fprintf(&b, "// new %s\n", refKind)
 	}
 	for _, c := range ev.Commits {
-		title, body := splitCommitMessage(c.Message, c.Title)
 		fmt.Fprintf(&b, "\n[<a href=\"%s\">%s</a>] %s",
 			html.EscapeString(c.URL), shortSHA(c.ID),
-			html.EscapeString(title))
-		if body != "" {
-			fmt.Fprintf(&b, "\n  <i>%s</i>", html.EscapeString(collapseBody(body)))
-		}
-		// fmt.Fprintf(&b, " — <b>%s</b>", html.EscapeString(c.Author.Name))
+			html.EscapeString(commitTitle(c.Message, c.Title)))
 	}
 	if ev.TotalCommitsCount > len(ev.Commits) {
 		fmt.Fprintf(&b, "\n\n<i>… and %d more (gitlab caps payload at 20)</i>",
@@ -872,31 +866,12 @@ func shortSHA(id string) string {
 	return id
 }
 
-func splitCommitMessage(message, title string) (string, string) {
-	message = strings.TrimSpace(message)
-	before, after, ok := strings.Cut(message, "\n")
-	full := strings.TrimSpace(before)
-	if full == "" {
-		full = strings.TrimSpace(title)
+func commitTitle(message, title string) string {
+	first, _, _ := strings.Cut(strings.TrimSpace(message), "\n")
+	if first = strings.TrimSpace(first); first != "" {
+		return first
 	}
-	if ok {
-		return full, strings.TrimSpace(after)
-	}
-	return full, ""
-}
-
-func collapseBody(s string) string {
-	s = strings.ReplaceAll(s, "\r\n", "\n")
-	lines := strings.Split(s, "\n")
-	cleaned := make([]string, 0, len(lines))
-	for _, ln := range lines {
-		ln = strings.TrimSpace(ln)
-		if ln != "" {
-			cleaned = append(cleaned, ln)
-		}
-	}
-	out := strings.Join(cleaned, " · ")
-	return truncate(out, commitBodyMaxLen)
+	return strings.TrimSpace(title)
 }
 
 func truncate(s string, n int) string {
