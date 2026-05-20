@@ -51,6 +51,11 @@ const (
 	maxConcurrentPushes    = 16
 )
 
+const (
+	aiPersonaSummary   = "summary"
+	aiPersonaDedAndrey = "ded-andrey"
+)
+
 type Config struct {
 	Listen              string
 	TelegramToken       string
@@ -67,6 +72,7 @@ type Config struct {
 	OpenRouterModel     string
 	OpenRouterProxyKey  string
 	OpenRouterTimeout   time.Duration
+	AIPersona           string
 	DiffMaxLinesAI      int
 	DiffMaxBytesPerFile int
 	LogLevel            string
@@ -179,6 +185,12 @@ func loadConfig() Config { //nolint:funlen
 		25*time.Second,
 		"OpenRouter call timeout",
 	)
+	flag.StringVar(
+		&cfg.AIPersona,
+		"ai-persona",
+		envOr("AI_PERSONA", aiPersonaSummary),
+		"LLM persona: summary or ded-andrey",
+	)
 	flag.IntVar(
 		&cfg.DiffMaxLinesAI,
 		"diff-max-lines-ai",
@@ -236,6 +248,14 @@ func validateConfig(cfg Config, logger zerolog.Logger) error {
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("missing required config: %s", strings.Join(missing, ", "))
+	}
+	if cfg.OpenRouterEnabled {
+		if _, ok := systemPromptFor(cfg.AIPersona); !ok {
+			return fmt.Errorf(
+				"invalid ai-persona %q: must be %q or %q",
+				cfg.AIPersona, aiPersonaSummary, aiPersonaDedAndrey,
+			)
+		}
 	}
 	if cfg.GitlabSigningToken == "" && cfg.GitlabSecretToken == "" {
 		logger.Warn().
@@ -453,7 +473,10 @@ func (s *Server) processPush(ctx context.Context, ev *PushEvent) error {
 	}
 	additions, deletions := countDiffStats(diffs)
 	fileCount := len(diffs)
-	summary := s.maybeSummarise(ctx, ev, refName, diffs)
+	summary := s.maybeSummarise(
+		ctx, ev, refKind, refName,
+		additions, deletions, fileCount, diffs,
+	)
 	text := formatMessage(
 		ev,
 		refKind,
@@ -473,7 +496,8 @@ func (s *Server) processPush(ctx context.Context, ev *PushEvent) error {
 func (s *Server) maybeSummarise(
 	ctx context.Context,
 	ev *PushEvent,
-	refName string,
+	refKind, refName string,
+	additions, deletions, fileCount int,
 	diffs []DiffEntry,
 ) string {
 	if !s.cfg.OpenRouterEnabled || len(diffs) == 0 {
@@ -484,19 +508,10 @@ func (s *Server) maybeSummarise(
 		s.cfg.DiffMaxLinesAI,
 		s.cfg.DiffMaxBytesPerFile,
 	)
-	commitTitles := make([]string, 0, len(ev.Commits))
-	for _, c := range ev.Commits {
-		commitTitles = append(commitTitles, "- "+c.Title)
-	}
-	system := summarySystemPrompt
-	user := fmt.Sprintf(
-		"Repository: `%s`\nBranch: `%s`\n\n"+
-			"Pushed commit titles:\n```\n%s\n```\n\n"+
-			"%s"+
-			"Diff:\n```\n%s\n```",
-		ev.Project.PathWithNamespace,
-		refName,
-		strings.Join(commitTitles, "\n"),
+	system, _ := systemPromptFor(s.cfg.AIPersona)
+	user := buildAIUserPrompt(
+		ev, refKind, refName,
+		additions, deletions, fileCount,
 		s.recentCommitsContext(ctx, ev.ProjectID, refName),
 		diffText,
 	)
@@ -506,6 +521,103 @@ func (s *Server) maybeSummarise(
 		return ""
 	}
 	return sum
+}
+
+func buildAIUserPrompt(
+	ev *PushEvent,
+	refKind, refName string,
+	additions, deletions, fileCount int,
+	recent, diffText string,
+) string {
+	var b strings.Builder
+	fmt.Fprintf(
+		&b,
+		"Repository: `%s` (project_id=%d, defaultbranch=`%s`, "+
+			"ref=`%s`, currentbranch=`%s`, url=`%s`)\n",
+		ev.Project.PathWithNamespace,
+		ev.Project.ID,
+		ev.Project.DefaultBranch,
+		ev.Ref,
+		refName,
+		ev.Project.WebURL,
+	)
+	if ev.Before == zeroSHA {
+		fmt.Fprintf(
+			&b,
+			"Note: new %s (no prior commits on this ref)\n",
+			refKind,
+		)
+	}
+	fmt.Fprintf(&b, "Pushed by: %s", ev.UserName)
+	if ev.UserUsername != "" {
+		fmt.Fprintf(&b, " (@%s)", ev.UserUsername)
+	}
+	b.WriteString("\n")
+	fmt.Fprintf(
+		&b,
+		"Stats: %d commit(s) in push (%d in payload); "+
+			"+%d/−%d across %d file(s)\n\n",
+		ev.TotalCommitsCount, len(ev.Commits),
+		additions, deletions, fileCount,
+	)
+	writeCommitList(&b, ev)
+	if recent != "" {
+		b.WriteString(recent)
+	}
+	fmt.Fprintf(&b, "Diff:\n``````\n%s\n``````", diffText)
+	return b.String()
+}
+
+func writeCommitList(b *strings.Builder, ev *PushEvent) {
+	if len(ev.Commits) == 0 {
+		return
+	}
+	b.WriteString("Pushed commits (order as received from webhook):\n```\n")
+	for _, c := range ev.Commits {
+		fmt.Fprintf(
+			b, "- [%s] %s",
+			shortSHA(c.ID), commitTitle(c.Message, c.Title),
+		)
+		writeCommitAuthor(b, c)
+		b.WriteString("\n")
+		if body := commitBody(c.Message); body != "" {
+			for line := range strings.SplitSeq(body, "\n") {
+				fmt.Fprintf(b, "    %s\n", line)
+			}
+		}
+	}
+	if ev.TotalCommitsCount > len(ev.Commits) {
+		fmt.Fprintf(
+			b,
+			"(… and %d more not in payload; "+
+				"gitlab caps push hook commits at 20)\n",
+			ev.TotalCommitsCount-len(ev.Commits),
+		)
+	}
+	b.WriteString("```\n\n")
+}
+
+func writeCommitAuthor(b *strings.Builder, c Commit) {
+	if c.Author.Name == "" && c.Author.Email == "" {
+		return
+	}
+	b.WriteString(" — ")
+	switch {
+	case c.Author.Name != "" && c.Author.Email != "":
+		fmt.Fprintf(b, "%s <%s>", c.Author.Name, c.Author.Email)
+	case c.Author.Name != "":
+		b.WriteString(c.Author.Name)
+	default:
+		b.WriteString(c.Author.Email)
+	}
+}
+
+func commitBody(message string) string {
+	_, rest, found := strings.Cut(strings.TrimSpace(message), "\n")
+	if !found {
+		return ""
+	}
+	return strings.TrimSpace(rest)
 }
 
 func (s *Server) recentCommitsContext(
@@ -633,32 +745,77 @@ type chatResp struct {
 	} `json:"error,omitempty"`
 }
 
-const summarySystemPrompt = `# Objective
+const summarySystemPromptDefault = `<role>
+You summarize Git push diffs into single-sentence updates for an engineering team's Slack channel.
+</role>
 
-Produce Slack-ready summaries of Git push diffs for the team.
+<task>
+You receive a Git push diff with metadata. Produce one sentence describing the substantive change so teammates can scan push activity at a glance.
+Because the summary posts automatically to Slack, it must be instantly skimmable and lead with what actually changed.
+</task>
 
-# Instructions
-
-- Output exactly one sentence
-- Use a maximum of 25 words
-- Maintain a technical, dry tone
-- Use all lowercase
-- Final language must always be English
-- Semi-informal internet speech is allowed
-- Do not include a preamble, markdown, or quotation marks
-- Return only the requested sentence
+<output_contract>
+- Output exactly one sentence, in English, all lowercase
+- Maximum 25 words
+- Technical and dry; semi-informal internet phrasing is fine
+- End on the final word — no terminal period
+- Respond with the bare sentence as plain text only: no preamble, no markdown, no quotation marks
 - Prefer concise, information-dense wording
-- Apply the length limit only to the final sentence
-- The final sentence must not end with a period
-- If constraints conflict, preserve the one-sentence, 25-word, lowercase, English-only output contract
-- Before finalizing, quickly verify wording, casing, word count, and that the sentence does not end with a period
+- If any instructions conflict, preserve this contract: one sentence, ≤25 words, lowercase, English, no terminal period
+</output_contract>
 
-# Content Guidance
+<content_guidance>
+- Describe the substantive change — what behavior, capability, or structure the diff alters
+- For a trivial diff (typo, formatting, version bump), say so explicitly and name the trivial change
+- For a diff with multiple changes, lead with the single most consequential one
+- When the diff context is too thin to determine the substantive change, state that limitation within the one-sentence contract rather than guessing
+</content_guidance>
 
-- Focus on the substantive change in the diff
-- If the diff is trivial, such as a typo, formatting change, or version bump, state that it is trivial
-- If the diff context is insufficient to determine the substantive change, do not guess; briefly state the limitation within the one-sentence limit
-- If multiple changes appear, mention the most consequential substantive change`
+<verification>
+Before responding, confirm the sentence is one sentence, under 25 words, all lowercase, English only, and does not end with a period.
+</verification>`
+
+const summarySystemPromptDedAndrey = `<role>
+Ты — Дед Андрей (Ded Andrey), ворчливый персонаж-болтун.
+Тебя приспособили к одной-единственной работе: коротко пересказывать Git push diff'ы для Slack-канала инженерной команды. Делаешь ты это с отвращением и постоянно бухтишь.
+</role>
+
+<character>
+Дед Андрей родился в СССР при Ленине и ностальгирует по Союзу: уверен, что раньше всё было правильно, а потом всё развалили — включая, очевидно, и этот ваш код. Всем недоволен, крайне саркастичен, груб. Это не злодей — это сварливый дед, которого заставили читать чужие коммиты, и он этому совсем не рад.
+</character>
+
+<task>
+Ты получаешь Git push diff с метаданными. Выдай одно предложение, описывающее суть изменения, чтобы команда могла окинуть взглядом активность в пуше.
+Сообщение постится в Slack автоматически, поэтому суть изменения должна читаться мгновенно и стоять в начале фразы, а ворчание идёт довеском, не вместо смысла.
+</task>
+
+<output_contract>
+- Выводи ровно ОДНО предложение, на русском языке. В каждом ответе, без исключений
+- Не длиннее ~25 слов
+- Стиль: грубая дворовая речь ворчливого деда. Технический смысл изменения обязателен, но подан с сарказмом и бухтением
+- Не ставь точку в конце — обрывай на последнем слове
+- Только голый текст: без преамбулы, без markdown, без кавычек, без списков и эмодзи
+- Суть изменения важнее ворчания: если на бухтёж не хватает места — режь бухтёж, а не смысл
+- При конфликте инструкций сохраняй именно этот контракт: одно предложение, ~25 слов, русский язык, без финальной точки
+</output_contract>
+
+<content_guidance>
+- Описывай содержательное изменение — какое поведение, возможность или структуру меняет diff
+- Для тривиального diff'а (опечатка, форматирование, бамп версии) так и скажи и назови, что именно за мелочь, заодно поворчав, что из-за такой ерунды пуш делают
+- Если в diff'е несколько изменений — веди с самого весомого, остальное игнорь
+- Если контекста diff'а слишком мало, чтобы понять суть, то так и заяви в рамках контракта одного предложения, а не выдумывай
+</content_guidance>`
+
+func systemPromptFor(persona string) (string, bool) {
+	switch persona {
+	case aiPersonaSummary:
+		return summarySystemPromptDefault, true
+	case aiPersonaDedAndrey:
+		return summarySystemPromptDedAndrey, true
+	default:
+		return "", false
+	}
+}
 
 func (s *Server) summarise(
 	ctx context.Context,
@@ -989,6 +1146,7 @@ func main() {
 			Str("listen", cfg.Listen).
 			Str("model", cfg.OpenRouterModel).
 			Bool("ai", cfg.OpenRouterEnabled).
+			Str("ai_persona", cfg.AIPersona).
 			Msg("gitlab-telegram-relay starting")
 		if err := httpSrv.ListenAndServe(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
