@@ -991,7 +991,7 @@ func compareFrom(ev *PushEvent, refName string) string {
 	if ev.After == zeroSHA {
 		return ""
 	}
-	if ev.Before != zeroSHA {
+	if ev.Before != zeroSHA && ev.Before != ev.After {
 		return ev.Before
 	}
 	if ev.Project.DefaultBranch == "" || ev.Project.DefaultBranch == refName {
