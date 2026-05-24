@@ -462,15 +462,7 @@ func (s *Server) processPush(ctx context.Context, ev *PushEvent) error {
 			repoLink(ev.Project), refLink(ev.Project, refKind, refName), refKind)
 		return s.sendTelegram(ctx, text)
 	}
-	var diffs []DiffEntry
-	if from := compareFrom(ev, refName); from != "" && s.cfg.GitlabToken != "" {
-		cmpResp, err := s.fetchCompare(ctx, ev.ProjectID, from, ev.After)
-		if err != nil {
-			logger.Warn().Err(err).Msg("fetch compare failed; proceeding without diff")
-		} else {
-			diffs = cmpResp.Diffs
-		}
-	}
+	diffs := s.collectDiffs(ctx, ev, refName, logger)
 	additions, deletions := countDiffStats(diffs)
 	fileCount := len(diffs)
 	summary := s.maybeSummarise(
@@ -686,6 +678,52 @@ func (s *Server) gitlabGetJSON(
 		return fmt.Errorf("%s decode: %w", what, err)
 	}
 	return nil
+}
+
+func (s *Server) collectDiffs(
+	ctx context.Context,
+	ev *PushEvent,
+	refName string,
+	logger zerolog.Logger,
+) []DiffEntry {
+	if s.cfg.GitlabToken == "" || ev.After == zeroSHA {
+		return nil
+	}
+	if from := compareFrom(ev, refName); from != "" {
+		cmpResp, err := s.fetchCompare(ctx, ev.ProjectID, from, ev.After)
+		if err != nil {
+			logger.Warn().Err(err).Msg("fetch compare failed; proceeding without diff")
+			return nil
+		}
+		return cmpResp.Diffs
+	}
+	if len(ev.Commits) == 0 {
+		return nil
+	}
+	diffs, err := s.fetchCommitDiff(ctx, ev.ProjectID, ev.After)
+	if err != nil {
+		logger.Warn().Err(err).Msg("fetch commit diff failed; proceeding without diff")
+		return nil
+	}
+	return diffs
+}
+
+func (s *Server) fetchCommitDiff(
+	ctx context.Context,
+	projectID int,
+	sha string,
+) ([]DiffEntry, error) {
+	u := fmt.Sprintf(
+		"%s/api/v4/projects/%d/repository/commits/%s/diff",
+		strings.TrimRight(s.cfg.GitlabBaseURL, "/"),
+		projectID,
+		url.PathEscape(sha),
+	)
+	var diffs []DiffEntry
+	if err := s.gitlabGetJSON(ctx, u, "commit diff", &diffs); err != nil {
+		return nil, err
+	}
+	return diffs, nil
 }
 
 func (s *Server) fetchCompare(
