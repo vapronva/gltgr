@@ -458,13 +458,13 @@ func (s *Server) processPush(ctx context.Context, ev *PushEvent) error {
 		Logger()
 	logger.Info().Msg("processing push")
 	if len(ev.Commits) == 0 && ev.After == zeroSHA {
-		text := fmt.Sprintf("🗑 [%s:%s] %s deleted",
+		text := fmt.Sprintf("// [%s:%s] %s deleted",
 			repoLink(ev.Project), refLink(ev.Project, refKind, refName), refKind)
 		return s.sendTelegram(ctx, text)
 	}
 	var diffs []DiffEntry
-	if ev.Before != zeroSHA && ev.After != zeroSHA && s.cfg.GitlabToken != "" {
-		cmpResp, err := s.fetchCompare(ctx, ev.ProjectID, ev.Before, ev.After)
+	if from := compareFrom(ev, refName); from != "" && s.cfg.GitlabToken != "" {
+		cmpResp, err := s.fetchCompare(ctx, ev.ProjectID, from, ev.After)
 		if err != nil {
 			logger.Warn().Err(err).Msg("fetch compare failed; proceeding without diff")
 		} else {
@@ -542,11 +542,19 @@ func buildAIUserPrompt(
 		ev.Project.WebURL,
 	)
 	if ev.Before == zeroSHA {
-		fmt.Fprintf(
-			&b,
-			"Note: new %s (no prior commits on this ref)\n",
-			refKind,
-		)
+		if ev.Project.DefaultBranch != "" && ev.Project.DefaultBranch != refName {
+			fmt.Fprintf(
+				&b,
+				"Note: new %s; diff shown is %s relative to default branch `%s`\n",
+				refKind, refKind, ev.Project.DefaultBranch,
+			)
+		} else {
+			fmt.Fprintf(
+				&b,
+				"Note: new %s (no prior commits on this ref)\n",
+				refKind,
+			)
+		}
 	}
 	fmt.Fprintf(&b, "Pushed by: %s", ev.UserName)
 	if ev.UserUsername != "" {
@@ -939,6 +947,19 @@ func parseRef(ref string) (string, string) {
 	default:
 		return "ref", ref
 	}
+}
+
+func compareFrom(ev *PushEvent, refName string) string {
+	if ev.After == zeroSHA {
+		return ""
+	}
+	if ev.Before != zeroSHA {
+		return ev.Before
+	}
+	if ev.Project.DefaultBranch == "" || ev.Project.DefaultBranch == refName {
+		return ""
+	}
+	return ev.Project.DefaultBranch
 }
 
 func repoLink(p Project) string {
