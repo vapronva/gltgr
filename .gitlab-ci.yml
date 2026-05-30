@@ -4,70 +4,24 @@ stages:
   - build
   - post-test
 
-workflow:
-  rules:
-    - if: $CI_COMMIT_TAG
-      variables:
-        CI_IMAGE_TAGS: latest,$CI_COMMIT_REF_NAME
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      variables:
-        CI_IMAGE_TAGS: latest,$CI_COMMIT_REF_NAME
-    - when: always
-
 include:
-  - component: $CI_SERVER_FQDN/ci/sast/sast@1
-  - component: $CI_SERVER_FQDN/ci/sast/iac@1
-  - component: $CI_SERVER_FQDN/ci/sast/bearer@1
-  - component: $CI_SERVER_FQDN/ci/sast/datadog@1
-  - component: $CI_SERVER_FQDN/ci/secret-detection/sd@1
-  - component: $CI_SERVER_FQDN/ci/dependency-scanning/ds@1
-  - component: $CI_SERVER_FQDN/ci/golang/init-vet@1
-  - component: $CI_SERVER_FQDN/ci/golang/lint@1
-  - component: $CI_SERVER_FQDN/ci/golang/test@1
-  - component: $CI_SERVER_FQDN/ci/docker/build-buildah@3
+  - component: $CI_SERVER_FQDN/ci/security/bundle@1
+  - component: $CI_SERVER_FQDN/ci/golang/init-vet@2
+  - component: $CI_SERVER_FQDN/ci/golang/lint@2
+  - component: $CI_SERVER_FQDN/ci/golang/test@2
+  - component: $CI_SERVER_FQDN/ci/docker/build-and-scan@4
     inputs:
-      ci_image_name: server
-      ci_image_tags: $CI_IMAGE_TAGS
-      dockerfile_path: Dockerfile
-      build_architectures: linux/amd64,linux/arm64
-  - component: $CI_SERVER_FQDN/ci/golang/build-binaries@1
-    inputs:
-      binary_name: gltgr
-      build_architectures: linux/amd64,linux/arm64,darwin/arm64
-  - component: $CI_SERVER_FQDN/ci/container-scanning/cs@1
-    inputs:
-      default_branch_image: $CI_REGISTRY_IMAGE/server:latest
-      application_repository: $CI_REGISTRY_IMAGE/server
-      application_tag: latest
-
-.build rules: &build-rules
-  rules:
-    - if: $CI_COMMIT_TAG || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      changes:
+      name: server
+      image: server
+      tags: latest,$CI_COMMIT_REF_NAME
+      architectures: linux/amd64,linux/arm64
+      rules_changes:
         - Dockerfile
-        - .gitlab-ci.yml
         - go.mod
         - go.sum
         - "**/*.go"
         - $CI_CONFIG_PATH
-
-build container image:
-  <<:
-    - *build-rules
-
-create manifest:
-  <<:
-    - *build-rules
-
-compile binaries:
-  <<:
-    - *build-rules
-
-container scanning:
-  <<:
-    - *build-rules
-  needs:
-    - job: build container image
-      optional: true
-    - job: create manifest
-      optional: true
+  - component: $CI_SERVER_FQDN/ci/golang/build-binaries@2
+    inputs:
+      binary_name: gltgr
+      build_architectures: linux/amd64,linux/arm64,darwin/arm64
