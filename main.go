@@ -1000,6 +1000,13 @@ func compareFrom(ev *PushEvent, refName string) string {
 	return ev.Project.DefaultBranch
 }
 
+func fullDiffURL(ev *PushEvent, refName string) string {
+	if from := compareFrom(ev, refName); from != "" {
+		return fmt.Sprintf("%s/-/compare/%s...%s", ev.Project.WebURL, from, ev.After)
+	}
+	return fmt.Sprintf("%s/-/commit/%s", ev.Project.WebURL, ev.After)
+}
+
 func repoLink(p Project) string {
 	return fmt.Sprintf(
 		`<a href="%s">%s</a>`,
@@ -1055,12 +1062,6 @@ func formatMessage(
 			ev.TotalCommitsCount-len(ev.Commits))
 	}
 	if fileCount > 0 {
-		compareURL := fmt.Sprintf(
-			"%s/-/compare/%s...%s",
-			ev.Project.WebURL,
-			ev.Before,
-			ev.After,
-		)
 		filesWord := "file"
 		if fileCount != 1 {
 			filesWord = "files"
@@ -1072,7 +1073,7 @@ func formatMessage(
 			deletions,
 			fileCount,
 			filesWord,
-			html.EscapeString(compareURL),
+			html.EscapeString(fullDiffURL(ev, refName)),
 		)
 	}
 	if summary != "" {
