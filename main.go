@@ -289,11 +289,12 @@ type Project struct {
 }
 
 type Commit struct {
-	ID      string `json:"id"`
-	Message string `json:"message"`
-	Title   string `json:"title"`
-	URL     string `json:"url"`
-	Author  struct {
+	ID        string `json:"id"`
+	Message   string `json:"message"`
+	Title     string `json:"title"`
+	Timestamp string `json:"timestamp"`
+	URL       string `json:"url"`
+	Author    struct {
 		Name  string `json:"name"`
 		Email string `json:"email"`
 	} `json:"author"`
@@ -504,6 +505,7 @@ func (s *Server) maybeSummarise(
 	user := buildAIUserPrompt(
 		ev, refKind, refName,
 		additions, deletions, fileCount,
+		time.Now(),
 		s.recentCommitsContext(ctx, ev.ProjectID, refName),
 		diffText,
 	)
@@ -519,6 +521,7 @@ func buildAIUserPrompt(
 	ev *PushEvent,
 	refKind, refName string,
 	additions, deletions, fileCount int,
+	pushedAt time.Time,
 	recent, diffText string,
 ) string {
 	var b strings.Builder
@@ -553,6 +556,7 @@ func buildAIUserPrompt(
 		fmt.Fprintf(&b, " (@%s)", ev.UserUsername)
 	}
 	b.WriteString("\n")
+	fmt.Fprintf(&b, "Push received: %s (server receive time)\n", formatTime(pushedAt))
 	fmt.Fprintf(
 		&b,
 		"Stats: %d commit(s) in push (%d in payload); "+
@@ -579,6 +583,9 @@ func writeCommitList(b *strings.Builder, ev *PushEvent) {
 			shortSHA(c.ID), commitTitle(c.Message, c.Title),
 		)
 		writeCommitAuthor(b, c)
+		if ts := formatTS(c.Timestamp); ts != "" {
+			fmt.Fprintf(b, " @ %s", ts)
+		}
 		b.WriteString("\n")
 		if body := commitBody(c.Message); body != "" {
 			for line := range strings.SplitSeq(body, "\n") {
@@ -641,6 +648,10 @@ func (s *Server) recentCommitsContext(
 	for _, c := range cs {
 		b.WriteString("- ")
 		b.WriteString(c.Title)
+		if ts := formatTS(c.CommittedDate); ts != "" {
+			b.WriteString(" @ ")
+			b.WriteString(ts)
+		}
 		b.WriteString("\n")
 	}
 	b.WriteString("```\n\n")
@@ -747,7 +758,8 @@ func (s *Server) fetchCompare(
 }
 
 type repoCommit struct {
-	Title string `json:"title"`
+	Title         string `json:"title"`
+	CommittedDate string `json:"committed_date"`
 }
 
 func (s *Server) fetchRecentCommits(
@@ -1103,6 +1115,24 @@ func commitTitle(message, title string) string {
 		return first
 	}
 	return strings.TrimSpace(title)
+}
+
+const displayTZOffsetSec = 3 * 60 * 60
+
+func formatTime(t time.Time) string {
+	return t.In(time.FixedZone("UTC+3", displayTZOffsetSec)).
+		Format("2006-01-02 15:04 MST")
+}
+
+func formatTS(ts string) string {
+	if ts == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return ""
+	}
+	return formatTime(t)
 }
 
 func truncate(s string, n int) string {
