@@ -211,6 +211,9 @@ func loadConfig() Config { //nolint:funlen
 	)
 	flag.BoolVar(&cfg.LogJSON, "log-json", envBool("LOG_JSON", false), "JSON log output")
 	flag.Parse()
+	cfg.GitlabBaseURL = strings.TrimRight(cfg.GitlabBaseURL, "/")
+	cfg.OpenRouterBaseURL = strings.TrimRight(cfg.OpenRouterBaseURL, "/")
+	cfg.TelegramBaseURL = strings.TrimRight(cfg.TelegramBaseURL, "/")
 	return cfg
 }
 
@@ -256,6 +259,18 @@ func validateConfig(cfg Config, logger zerolog.Logger) error {
 				cfg.AIPersona, aiPersonaSummary, aiPersonaDedAndrey,
 			)
 		}
+	}
+	if cfg.DiffMaxBytesPerFile <= 0 {
+		return fmt.Errorf(
+			"diff-max-bytes-per-file must be > 0, got %d",
+			cfg.DiffMaxBytesPerFile,
+		)
+	}
+	if cfg.DiffMaxLinesAI <= 0 {
+		return fmt.Errorf(
+			"diff-max-lines-ai must be > 0, got %d",
+			cfg.DiffMaxLinesAI,
+		)
 	}
 	if cfg.GitlabSigningToken == "" && cfg.GitlabSecretToken == "" {
 		logger.Warn().
@@ -313,9 +328,16 @@ type DiffEntry struct {
 	Diff        string `json:"diff"`
 }
 
+type diffStats struct {
+	additions int
+	deletions int
+	files     int
+}
+
 type Server struct {
 	cfg      Config
 	client   *http.Client
+	aiClient *http.Client
 	log      zerolog.Logger
 	inflight sync.WaitGroup
 	sem      chan struct{}
@@ -323,10 +345,11 @@ type Server struct {
 
 func newServer(cfg Config, logger zerolog.Logger) *Server {
 	return &Server{
-		cfg:    cfg,
-		client: &http.Client{Timeout: defaultHTTPTimeout},
-		log:    logger,
-		sem:    make(chan struct{}, maxConcurrentPushes),
+		cfg:      cfg,
+		client:   &http.Client{Timeout: defaultHTTPTimeout},
+		aiClient: &http.Client{},
+		log:      logger,
+		sem:      make(chan struct{}, maxConcurrentPushes),
 	}
 }
 
@@ -381,17 +404,27 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
-	s.inflight.Go(func() {
-		defer func() { <-s.sem }()
-		ctx, cancel := context.WithTimeout(context.Background(), pushProcessTimeout)
-		defer cancel()
-		if perr := s.processPush(ctx, &ev); perr != nil {
+	s.inflight.Go(func() { s.runPush(&ev) })
+}
+
+func (s *Server) runPush(ev *PushEvent) {
+	defer func() { <-s.sem }()
+	defer func() {
+		if rec := recover(); rec != nil {
 			s.log.Error().
-				Err(perr).
+				Interface("panic", rec).
 				Str("project", ev.Project.PathWithNamespace).
-				Msg("process push failed")
+				Msg("recovered panic while processing push")
 		}
-	})
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), pushProcessTimeout)
+	defer cancel()
+	if err := s.processPush(ctx, ev); err != nil {
+		s.log.Error().
+			Err(err).
+			Str("project", ev.Project.PathWithNamespace).
+			Msg("process push failed")
+	}
 }
 
 func isPushEvent(header string, ev *PushEvent) bool {
@@ -450,6 +483,7 @@ func verifySigningToken(h http.Header, body []byte, token string) bool {
 }
 
 func (s *Server) processPush(ctx context.Context, ev *PushEvent) error {
+	receivedAt := time.Now()
 	refKind, refName := parseRef(ev.Ref)
 	logger := s.log.With().
 		Str("project", ev.Project.PathWithNamespace).
@@ -464,21 +498,9 @@ func (s *Server) processPush(ctx context.Context, ev *PushEvent) error {
 		return s.sendTelegram(ctx, text)
 	}
 	diffs := s.collectDiffs(ctx, ev, refName, logger)
-	additions, deletions := countDiffStats(diffs)
-	fileCount := len(diffs)
-	summary := s.maybeSummarise(
-		ctx, ev, refKind, refName,
-		additions, deletions, fileCount, diffs,
-	)
-	text := formatMessage(
-		ev,
-		refKind,
-		refName,
-		additions,
-		deletions,
-		fileCount,
-		summary,
-	)
+	stats := countDiffStats(diffs)
+	summary := s.maybeSummarise(ctx, ev, refKind, refName, stats, diffs, receivedAt)
+	text := formatMessage(ev, refKind, refName, stats, summary)
 	if err := s.sendTelegram(ctx, text); err != nil {
 		return fmt.Errorf("telegram: %w", err)
 	}
@@ -490,8 +512,9 @@ func (s *Server) maybeSummarise(
 	ctx context.Context,
 	ev *PushEvent,
 	refKind, refName string,
-	additions, deletions, fileCount int,
+	stats diffStats,
 	diffs []DiffEntry,
+	receivedAt time.Time,
 ) string {
 	if !s.cfg.OpenRouterEnabled || len(diffs) == 0 {
 		return ""
@@ -504,8 +527,8 @@ func (s *Server) maybeSummarise(
 	system, _ := systemPromptFor(s.cfg.AIPersona)
 	user := buildAIUserPrompt(
 		ev, refKind, refName,
-		additions, deletions, fileCount,
-		time.Now(),
+		stats,
+		receivedAt,
 		s.recentCommitsContext(ctx, ev.ProjectID, refName),
 		diffText,
 	)
@@ -520,7 +543,7 @@ func (s *Server) maybeSummarise(
 func buildAIUserPrompt(
 	ev *PushEvent,
 	refKind, refName string,
-	additions, deletions, fileCount int,
+	stats diffStats,
 	pushedAt time.Time,
 	recent, diffText string,
 ) string {
@@ -546,8 +569,9 @@ func buildAIUserPrompt(
 		} else {
 			fmt.Fprintf(
 				&b,
-				"Note: new %s (no prior commits on this ref)\n",
-				refKind,
+				"Note: new %s with no diff base; the diff and stats below "+
+					"cover only the latest commit, though %d commit(s) were pushed\n",
+				refKind, ev.TotalCommitsCount,
 			)
 		}
 	}
@@ -562,7 +586,7 @@ func buildAIUserPrompt(
 		"Stats: %d commit(s) in push (%d in payload); "+
 			"+%d/−%d across %d file(s)\n\n",
 		ev.TotalCommitsCount, len(ev.Commits),
-		additions, deletions, fileCount,
+		stats.additions, stats.deletions, stats.files,
 	)
 	writeCommitList(&b, ev)
 	if recent != "" {
@@ -726,7 +750,7 @@ func (s *Server) fetchCommitDiff(
 ) ([]DiffEntry, error) {
 	u := fmt.Sprintf(
 		"%s/api/v4/projects/%d/repository/commits/%s/diff",
-		strings.TrimRight(s.cfg.GitlabBaseURL, "/"),
+		s.cfg.GitlabBaseURL,
 		projectID,
 		url.PathEscape(sha),
 	)
@@ -744,8 +768,8 @@ func (s *Server) fetchCompare(
 ) (*CompareResponse, error) {
 	u := fmt.Sprintf(
 		"%s/api/v4/projects/%d/repository/compare"+
-			"?from=%s&to=%s&unidiff=true&straight=true",
-		strings.TrimRight(s.cfg.GitlabBaseURL, "/"),
+			"?from=%s&to=%s&unidiff=true&straight=false",
+		s.cfg.GitlabBaseURL,
 		projectID,
 		url.QueryEscape(from),
 		url.QueryEscape(to),
@@ -770,7 +794,7 @@ func (s *Server) fetchRecentCommits(
 	u := fmt.Sprintf(
 		"%s/api/v4/projects/%d/repository/commits"+
 			"?ref_name=%s&per_page=%d",
-		strings.TrimRight(s.cfg.GitlabBaseURL, "/"),
+		s.cfg.GitlabBaseURL,
 		projectID,
 		url.QueryEscape(ref),
 		recentCommitsCount,
@@ -910,10 +934,7 @@ func (s *Server) summarise(
 	req, err := http.NewRequestWithContext(
 		cctx,
 		http.MethodPost,
-		strings.TrimRight(
-			s.cfg.OpenRouterBaseURL,
-			"/",
-		)+"/chat/completions",
+		s.cfg.OpenRouterBaseURL+"/chat/completions",
 		bytes.NewReader(body),
 	)
 	if err != nil {
@@ -924,24 +945,25 @@ func (s *Server) summarise(
 	if s.cfg.OpenRouterProxyKey != "" {
 		req.Header.Set("X-Cmld-Aig-Proxy-Key", s.cfg.OpenRouterProxyKey)
 	}
-	resp, err := s.client.Do(req)
+	resp, err := s.aiClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("openrouter request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, aiResponseMaxBytes))
 	var cr chatResp
-	if err = json.Unmarshal(rb, &cr); err != nil {
-		return "", fmt.Errorf(
-			"openrouter decode: %w (body: %s)",
-			err,
-			truncate(string(rb), aiErrPreviewBytes),
-		)
-	}
-	if cr.Error != nil {
-		return "", errors.New(cr.Error.Message)
-	}
-	if len(cr.Choices) == 0 {
+	err = json.Unmarshal(rb, &cr)
+	switch {
+	case cr.Error != nil:
+		return "", fmt.Errorf("openrouter %d: %s",
+			resp.StatusCode, cr.Error.Message)
+	case resp.StatusCode != http.StatusOK:
+		return "", fmt.Errorf("openrouter %d: %s",
+			resp.StatusCode, truncate(string(rb), aiErrPreviewBytes))
+	case err != nil:
+		return "", fmt.Errorf("openrouter decode: %w (body: %s)",
+			err, truncate(string(rb), aiErrPreviewBytes))
+	case len(cr.Choices) == 0:
 		return "", errors.New("no choices in response")
 	}
 	return strings.TrimSpace(cr.Choices[0].Message.Content), nil
@@ -957,12 +979,7 @@ func (s *Server) scrubTG(err error) error {
 }
 
 func (s *Server) sendTelegram(ctx context.Context, text string) error {
-	if utf16Len(text) > tgMaxMessageChars {
-		text = truncateUTF16(
-			text,
-			tgMaxMessageChars-tgTruncateSuffixBudget,
-		) + tgTruncateMarker
-	}
+	text = truncateTelegramHTML(text)
 	form := url.Values{
 		"chat_id":                  {s.cfg.TelegramChatID},
 		"text":                     {text},
@@ -973,7 +990,7 @@ func (s *Server) sendTelegram(ctx context.Context, text string) error {
 		form.Set("message_thread_id", s.cfg.TelegramThreadID)
 	}
 	u := fmt.Sprintf("%s/bot%s/sendMessage",
-		strings.TrimRight(s.cfg.TelegramBaseURL, "/"), s.cfg.TelegramToken)
+		s.cfg.TelegramBaseURL, s.cfg.TelegramToken)
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
@@ -1022,7 +1039,10 @@ func compareFrom(ev *PushEvent, refName string) string {
 
 func fullDiffURL(ev *PushEvent, refName string) string {
 	if from := compareFrom(ev, refName); from != "" {
-		return fmt.Sprintf("%s/-/compare/%s...%s", ev.Project.WebURL, from, ev.After)
+		return fmt.Sprintf(
+			"%s/-/compare/%s...%s",
+			ev.Project.WebURL, url.PathEscape(from), ev.After,
+		)
 	}
 	return fmt.Sprintf("%s/-/commit/%s", ev.Project.WebURL, ev.After)
 }
@@ -1053,7 +1073,7 @@ func refLink(p Project, kind, name string) string {
 func formatMessage(
 	ev *PushEvent,
 	refKind, refName string,
-	additions, deletions, fileCount int,
+	stats diffStats,
 	summary string,
 ) string {
 	var b strings.Builder
@@ -1081,23 +1101,29 @@ func formatMessage(
 		fmt.Fprintf(&b, "\n\n<i>… and %d more (gitlab caps payload at 20)</i>",
 			ev.TotalCommitsCount-len(ev.Commits))
 	}
-	if fileCount > 0 {
+	if stats.files > 0 {
 		filesWord := "file"
-		if fileCount != 1 {
+		if stats.files != 1 {
 			filesWord = "files"
+		}
+		diffLabel := "full diff"
+		if compareFrom(ev, refName) == "" {
+			diffLabel = "latest commit"
 		}
 		fmt.Fprintf(
 			&b,
-			"\n\n// +%d/−%d across %d %s · <a href=\"%s\">full diff</a>",
-			additions,
-			deletions,
-			fileCount,
+			"\n\n// +%d/−%d across %d %s · <a href=\"%s\">%s</a>",
+			stats.additions,
+			stats.deletions,
+			stats.files,
 			filesWord,
 			html.EscapeString(fullDiffURL(ev, refName)),
+			diffLabel,
 		)
 	}
 	if summary != "" {
-		fmt.Fprintf(&b, "\n// <i>%s</i>", html.EscapeString(summary))
+		oneLine := strings.Join(strings.Fields(summary), " ")
+		fmt.Fprintf(&b, "\n// <i>%s</i>", html.EscapeString(oneLine))
 	}
 	return b.String()
 }
@@ -1135,14 +1161,21 @@ func formatTS(ts string) string {
 	return formatTime(t)
 }
 
-func truncate(s string, n int) string {
+func runeSafeCut(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
 	for n > 0 && !utf8.RuneStart(s[n]) {
 		n--
 	}
-	return s[:n] + "…"
+	return s[:n]
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return runeSafeCut(s, n) + "…"
 }
 
 func utf16Len(s string) int {
@@ -1157,36 +1190,61 @@ func utf16Len(s string) int {
 	return n
 }
 
-func truncateUTF16(s string, limit int) string {
-	n := 0
-	for i, r := range s {
-		w := 1
-		if r > maxBMPRune {
-			w = 2
+func visibleUTF16Len(s string) int {
+	var b strings.Builder
+	inTag := false
+	for _, r := range s {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+		case !inTag:
+			b.WriteRune(r)
 		}
-		if n+w > limit {
-			return s[:i]
-		}
-		n += w
 	}
-	return s
+	return utf16Len(html.UnescapeString(b.String()))
 }
 
-func countDiffStats(diffs []DiffEntry) (int, int) {
-	var additions, deletions int
+func truncateTelegramHTML(text string) string {
+	if visibleUTF16Len(text) <= tgMaxMessageChars {
+		return text
+	}
+	budget := tgMaxMessageChars - tgTruncateSuffixBudget
+	var b strings.Builder
+	used := 0
+	for line := range strings.SplitSeq(text, "\n") {
+		w := visibleUTF16Len(line)
+		if used+w > budget {
+			break
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+		used += w + 1
+	}
+	return b.String() + tgTruncateMarker
+}
+
+func countDiffStats(diffs []DiffEntry) diffStats {
+	stats := diffStats{files: len(diffs)}
 	for _, d := range diffs {
+		inHunk := false
 		for ln := range strings.SplitSeq(d.Diff, "\n") {
 			switch {
-			case strings.HasPrefix(ln, "+++"), strings.HasPrefix(ln, "---"):
+			case strings.HasPrefix(ln, "@@ "):
+				inHunk = true
+			case !inHunk:
 				continue
 			case strings.HasPrefix(ln, "+"):
-				additions++
+				stats.additions++
 			case strings.HasPrefix(ln, "-"):
-				deletions++
+				stats.deletions++
 			}
 		}
 	}
-	return additions, deletions
+	return stats
 }
 
 func buildDiffForAI(diffs []DiffEntry, maxLines, maxBytesPerFile int) string {
@@ -1209,9 +1267,9 @@ func buildDiffForAI(diffs []DiffEntry, maxLines, maxBytesPerFile int) string {
 		fmt.Fprintf(&b, "--- %s\n", path)
 		diff := d.Diff
 		if len(diff) > maxBytesPerFile {
-			diff = diff[:maxBytesPerFile] + "\n[… file truncated]"
+			diff = runeSafeCut(diff, maxBytesPerFile) + "\n[… file truncated]"
 		}
-		lines := strings.Split(diff, "\n")
+		lines := strings.Split(strings.TrimSuffix(diff, "\n"), "\n")
 		if len(lines) > remaining {
 			lines = lines[:remaining]
 			lines = append(lines, "[… file truncated]")
@@ -1258,6 +1316,7 @@ func main() {
 		}
 	})
 	<-ctx.Done()
+	stop()
 	logger.Info().Msg("shutdown signal received")
 	shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
@@ -1268,7 +1327,7 @@ func main() {
 	go func() { srv.inflight.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(shutdownTimeout):
+	case <-time.After(pushProcessTimeout):
 		logger.Warn().Msg("in-flight pushes did not drain before timeout")
 	}
 	wg.Wait()
