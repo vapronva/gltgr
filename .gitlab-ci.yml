@@ -16,6 +16,7 @@ include:
       tags: latest,$CI_COMMIT_REF_NAME
       architectures: linux/amd64,linux/arm64
       rules_changes:
+        - .dockerignore
         - Dockerfile
         - go.mod
         - go.sum

@@ -170,7 +170,7 @@ func loadConfig() Config { //nolint:funlen
 	flag.StringVar(
 		&cfg.OpenRouterModel,
 		"openrouter-model",
-		envOr("OPENROUTER_MODEL", "anthropic/claude-opus-4.8"),
+		envOr("OPENROUTER_MODEL", "anthropic/claude-sonnet-5"),
 		"OpenRouter model ID",
 	)
 	flag.StringVar(

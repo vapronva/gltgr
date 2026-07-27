@@ -1,0 +1,8 @@
+.git
+.gitlab-ci.yml
+LICENSE
+CODEOWNERS
+*.md
+/gltgr
+*.test
+*.out
